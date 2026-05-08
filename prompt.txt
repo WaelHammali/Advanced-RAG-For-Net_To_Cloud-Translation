@@ -1,0 +1,9 @@
+I have one router R1 with 1 interface, one switch SW1, one PC PC1, and one server S1.
+PC1 is connected to SW1.
+S1 is connected to SW1.
+SW1 is connected to R1.
+PC1 should be the bastion.
+S1 should be private but needs internet access.
+base cidr 10.0.0.0/16
+SW1 = 10.0.1.0/27
+firewall mode is sg

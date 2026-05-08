@@ -1,0 +1,29 @@
+variable "aws_region" {
+  description = "AWS region used for deployment."
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "availability_zone" {
+  description = "Availability zone used for generated subnets."
+  type        = string
+  default     = "us-west-2a"
+}
+
+variable "admin_cidr" {
+  description = "CIDR allowed to SSH into lab instances. Default 0.0.0.0/0 is lab-only."
+  type        = string
+  default     = "0.0.0.0/0"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type for generated PCs and servers."
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "router_instance_type" {
+  description = "Deprecated fallback only. Real router appliance type is selected automatically by router edge/interface count."
+  type        = string
+  default     = "t3.micro"
+}

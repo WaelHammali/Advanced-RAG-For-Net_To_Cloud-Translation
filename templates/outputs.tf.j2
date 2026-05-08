@@ -1,0 +1,108 @@
+{# ============================================================
+   NET2TF outputs.tf
+   Safe version: no namespace/ns dependency
+   Works for:
+   - no-router inferred VPC
+   - real router VPC + router appliance
+   - PCs/servers
+   - subnets
+   ============================================================ #}
+
+{% set dp = architecture.domain_plan %}
+{% set routers = dp.routers %}
+
+{# ------------------------------
+   VPC and subnet outputs
+   ------------------------------ #}
+{% for rid, router in routers.items() %}
+output "{{ rid | lower }}_vpc_id" {
+  value = aws_vpc.{{ rid | lower }}.id
+}
+
+{% for subnet in router.subnets %}
+output "{{ rid | lower }}_{{ subnet.name | lower }}_subnet_id" {
+  value = aws_subnet.{{ rid | lower }}_{{ subnet.name | lower }}.id
+}
+
+{% endfor %}
+{% endfor %}
+
+{# ------------------------------
+   Host outputs: PCs/servers
+   ------------------------------ #}
+{% for rid, router in routers.items() %}
+{% for subnet in router.subnets %}
+{% for hp in subnet.host_placements %}
+{% set host = hp.host_id | lower %}
+output "{{ host }}_private_ip" {
+  value = aws_instance.{{ host }}.private_ip
+}
+
+{% if hp.exposure == "public" %}
+output "{{ host }}_public_ip" {
+  value = aws_instance.{{ host }}.public_ip
+}
+
+output "{{ host }}_ssh_command" {
+  value = "ssh -i {{ hp.host_id }}.pem ec2-user@${aws_instance.{{ host }}.public_ip}"
+}
+{% endif %}
+
+output "{{ host }}_pem_file" {
+  value = "{{ hp.host_id }}.pem"
+}
+
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+{# ------------------------------
+   Router appliance outputs
+   These outputs are generated only if the main template creates
+   aws_instance.<router>_router_appliance.
+   If your main.tf does not create router appliances, remove this section.
+   ------------------------------ #}
+{% for rid in real_router_ids %}
+{% set router_res = rid | lower ~ "_router_appliance" %}
+output "{{ rid | lower }}_router_private_ip" {
+  value = aws_instance.{{ router_res }}.private_ip
+}
+
+output "{{ rid | lower }}_router_public_ip" {
+  value = aws_instance.{{ router_res }}.public_ip
+}
+
+# Aliases used by Ansible inventory planner for router targets like R1.
+output "{{ rid | lower }}_private_ip" {
+  value = aws_instance.{{ router_res }}.private_ip
+}
+
+output "{{ rid | lower }}_public_ip" {
+  value = aws_instance.{{ router_res }}.public_ip
+}
+
+output "{{ rid | lower }}_router_ssh_command" {
+  value = "ssh -i PC1.pem ec2-user@${aws_instance.{{ router_res }}.public_ip}"
+}
+
+output "{{ rid | lower }}_ssh_command" {
+  value = "ssh -i PC1.pem ec2-user@${aws_instance.{{ router_res }}.public_ip}"
+}
+
+output "{{ rid | lower }}_router_pem_file" {
+  value = "PC1.pem"
+}
+
+output "{{ rid | lower }}_pem_file" {
+  value = "PC1.pem"
+}
+{% endfor %}
+
+{# ------------------------------
+   Connectivity outputs
+   ------------------------------ #}
+{% if dp.connectivity_mode == "tgw" %}
+output "transit_gateway_id" {
+  value = aws_ec2_transit_gateway.core.id
+}
+{% endif %}

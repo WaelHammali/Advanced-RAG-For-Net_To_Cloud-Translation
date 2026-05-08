@@ -1,0 +1,10 @@
+groq
+pydantic
+jinja2
+sentence-transformers
+transformers
+faiss-cpu
+numpy
+torch
+scikit-learn
+ansible

@@ -1,0 +1,499 @@
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+{% set ns = namespace(has_public_by_router={}, needs_nat_by_router={}, nat_subnet_by_router={}) %}
+
+{% for rid, router in routers.items() %}
+{% set rns = namespace(has_public=false, needs_nat=false, nat_subnet_name="") %}
+{% for subnet in router.subnets %}
+{% if subnet.public %}
+{% set rns.has_public = true %}
+{% if rns.nat_subnet_name == "" %}
+{% set rns.nat_subnet_name = subnet.name %}
+{% endif %}
+{% endif %}
+{% if subnet.needs_nat %}
+{% set rns.needs_nat = true %}
+{% endif %}
+{% endfor %}
+{% set _ = ns.has_public_by_router.update({rid: rns.has_public}) %}
+{% set _ = ns.needs_nat_by_router.update({rid: rns.needs_nat}) %}
+{% set _ = ns.nat_subnet_by_router.update({rid: rns.nat_subnet_name}) %}
+{% endfor %}
+
+{% for rid, router in routers.items() %}
+resource "aws_vpc" "{{ rid|lower }}" {
+  cidr_block           = "{{ router.vpc_cidr }}"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "{{ rid }}"
+  }
+}
+
+{% if ns.has_public_by_router[rid] %}
+resource "aws_internet_gateway" "{{ rid|lower }}" {
+  vpc_id = aws_vpc.{{ rid|lower }}.id
+
+  tags = {
+    Name = "{{ rid }}-igw"
+  }
+}
+{% endif %}
+
+{% for subnet in router.subnets %}
+resource "aws_subnet" "{{ rid|lower }}_{{ subnet.name|lower }}" {
+  vpc_id                  = aws_vpc.{{ rid|lower }}.id
+  cidr_block              = "{{ subnet.cidr }}"
+  availability_zone       = var.availability_zone
+  map_public_ip_on_launch = {{ "true" if subnet.public else "false" }}
+
+  tags = {
+    Name = "{{ rid }}-{{ subnet.name }}"
+  }
+}
+
+resource "aws_route_table" "{{ rid|lower }}_{{ subnet.name|lower }}" {
+  vpc_id = aws_vpc.{{ rid|lower }}.id
+
+  tags = {
+    Name = "{{ rid }}-{{ subnet.name }}-rt"
+  }
+}
+
+resource "aws_route_table_association" "{{ rid|lower }}_{{ subnet.name|lower }}" {
+  subnet_id      = aws_subnet.{{ rid|lower }}_{{ subnet.name|lower }}.id
+  route_table_id = aws_route_table.{{ rid|lower }}_{{ subnet.name|lower }}.id
+}
+
+{% if subnet.public and ns.has_public_by_router[rid] %}
+resource "aws_route" "{{ rid|lower }}_{{ subnet.name|lower }}_default_igw" {
+  route_table_id         = aws_route_table.{{ rid|lower }}_{{ subnet.name|lower }}.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.{{ rid|lower }}.id
+}
+{% elif subnet.needs_nat and ns.has_public_by_router[rid] and ns.needs_nat_by_router[rid] and ns.nat_subnet_by_router[rid] != "" %}
+resource "aws_route" "{{ rid|lower }}_{{ subnet.name|lower }}_default_nat" {
+  route_table_id         = aws_route_table.{{ rid|lower }}_{{ subnet.name|lower }}.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.{{ rid|lower }}.id
+}
+{% endif %}
+
+{% endfor %}
+
+{% if ns.has_public_by_router[rid] and ns.needs_nat_by_router[rid] and ns.nat_subnet_by_router[rid] != "" %}
+resource "aws_eip" "{{ rid|lower }}_nat" {
+  domain = "vpc"
+
+  depends_on = [
+    aws_internet_gateway.{{ rid|lower }}
+  ]
+}
+
+resource "aws_nat_gateway" "{{ rid|lower }}" {
+  allocation_id = aws_eip.{{ rid|lower }}_nat.id
+  subnet_id     = aws_subnet.{{ rid|lower }}_{{ ns.nat_subnet_by_router[rid]|lower }}.id
+
+  tags = {
+    Name = "{{ rid }}-nat"
+  }
+
+  depends_on = [
+    aws_internet_gateway.{{ rid|lower }}
+  ]
+}
+{% endif %}
+
+{% endfor %}
+
+{% if connectivity_mode == "peering" %}
+{% for link in router_links %}
+{% set a = link[0] %}
+{% set b = link[1] %}
+resource "aws_vpc_peering_connection" "{{ a|lower }}_{{ b|lower }}" {
+  vpc_id      = aws_vpc.{{ a|lower }}.id
+  peer_vpc_id = aws_vpc.{{ b|lower }}.id
+  auto_accept = true
+
+  tags = {
+    Name = "{{ a }}-{{ b }}-peering"
+  }
+}
+
+{% for subnet in routers[a].subnets %}
+resource "aws_route" "{{ a|lower }}_{{ subnet.name|lower }}_to_{{ b|lower }}" {
+  route_table_id            = aws_route_table.{{ a|lower }}_{{ subnet.name|lower }}.id
+  destination_cidr_block    = "{{ routers[b].vpc_cidr }}"
+  vpc_peering_connection_id = aws_vpc_peering_connection.{{ a|lower }}_{{ b|lower }}.id
+}
+{% endfor %}
+
+{% for subnet in routers[b].subnets %}
+resource "aws_route" "{{ b|lower }}_{{ subnet.name|lower }}_to_{{ a|lower }}" {
+  route_table_id            = aws_route_table.{{ b|lower }}_{{ subnet.name|lower }}.id
+  destination_cidr_block    = "{{ routers[a].vpc_cidr }}"
+  vpc_peering_connection_id = aws_vpc_peering_connection.{{ a|lower }}_{{ b|lower }}.id
+}
+{% endfor %}
+{% endfor %}
+{% endif %}
+
+{% if connectivity_mode == "tgw" %}
+resource "aws_ec2_transit_gateway" "core" {
+  description = "Transit Gateway for inter-router connectivity"
+
+  default_route_table_association = "disable"
+  default_route_table_propagation = "disable"
+
+  tags = {
+    Name = "net2tf-tgw"
+  }
+}
+
+resource "aws_ec2_transit_gateway_route_table" "core" {
+  transit_gateway_id = aws_ec2_transit_gateway.core.id
+
+  tags = {
+    Name = "net2tf-tgw-rt"
+  }
+}
+
+{% for rid, router in routers.items() %}
+resource "aws_ec2_transit_gateway_vpc_attachment" "{{ rid|lower }}" {
+  subnet_ids         = [aws_subnet.{{ rid|lower }}_{{ router.subnets[0].name|lower }}.id]
+  transit_gateway_id = aws_ec2_transit_gateway.core.id
+  vpc_id             = aws_vpc.{{ rid|lower }}.id
+
+  transit_gateway_default_route_table_association = false
+  transit_gateway_default_route_table_propagation = false
+
+  tags = {
+    Name = "{{ rid }}-tgw-attach"
+  }
+}
+
+resource "aws_ec2_transit_gateway_route_table_association" "{{ rid|lower }}" {
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.{{ rid|lower }}.id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.core.id
+}
+
+resource "aws_ec2_transit_gateway_route_table_propagation" "{{ rid|lower }}" {
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.{{ rid|lower }}.id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.core.id
+}
+
+{% endfor %}
+
+{% for rid, router in routers.items() %}
+{% for subnet in router.subnets %}
+{% for other_rid, other_router in routers.items() %}
+{% if other_rid != rid %}
+resource "aws_route" "{{ rid|lower }}_{{ subnet.name|lower }}_to_{{ other_rid|lower }}_tgw" {
+  route_table_id         = aws_route_table.{{ rid|lower }}_{{ subnet.name|lower }}.id
+  destination_cidr_block = "{{ other_router.vpc_cidr }}"
+  transit_gateway_id     = aws_ec2_transit_gateway.core.id
+
+  depends_on = [
+    aws_ec2_transit_gateway_vpc_attachment.{{ rid|lower }},
+    aws_ec2_transit_gateway_vpc_attachment.{{ other_rid|lower }},
+    aws_ec2_transit_gateway_route_table_association.{{ rid|lower }},
+    aws_ec2_transit_gateway_route_table_association.{{ other_rid|lower }},
+    aws_ec2_transit_gateway_route_table_propagation.{{ rid|lower }},
+    aws_ec2_transit_gateway_route_table_propagation.{{ other_rid|lower }}
+  ]
+}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+
+{% for rid, router in routers.items() %}
+{% for fw in router.attached_firewalls %}
+resource "aws_security_group" "{{ fw|lower }}" {
+  name        = "{{ fw|lower }}-sg"
+  description = "Firewall SG for {{ fw }}"
+  vpc_id      = aws_vpc.{{ rid|lower }}.id
+
+  {% for rrid, rrouter in routers.items() %}
+  ingress {
+    description = "Internal traffic from {{ rrid }}"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["{{ rrouter.vpc_cidr }}"]
+  }
+  {% endfor %}
+
+  egress {
+    description = "Allow all outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "{{ fw }}-sg"
+  }
+}
+{% endfor %}
+{% endfor %}
+
+{% for rid, router in routers.items() %}
+{% for subnet in router.subnets %}
+{% for hp in subnet.host_placements %}
+resource "tls_private_key" "{{ hp.host_id|lower }}" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "{{ hp.host_id|lower }}" {
+  key_name_prefix = "net2tf-{{ hp.host_id|lower }}-"
+  public_key      = tls_private_key.{{ hp.host_id|lower }}.public_key_openssh
+}
+
+resource "local_file" "{{ hp.host_id|lower }}" {
+  filename        = "{{ hp.host_id }}.pem"
+  content         = tls_private_key.{{ hp.host_id|lower }}.private_key_pem
+  file_permission = "0600"
+}
+
+resource "aws_security_group" "{{ hp.host_id|lower }}" {
+  name        = "{{ hp.host_id|lower }}-sg"
+  description = "Security group for {{ hp.host_id }}"
+  vpc_id      = aws_vpc.{{ rid|lower }}.id
+
+  {% for rrid, rrouter in routers.items() %}
+  ingress {
+    description = "Internal traffic from {{ rrid }}"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["{{ rrouter.vpc_cidr }}"]
+  }
+  {% endfor %}
+
+  ingress {
+    description = "ICMP from RFC1918 internal networks"
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = [
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ]
+  }
+
+  ingress {
+    description = "SSH from anywhere - lab only"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_cidr]
+  }
+
+  egress {
+    description = "Allow all outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "{{ hp.host_id }}-sg"
+  }
+}
+
+resource "aws_instance" "{{ hp.host_id|lower }}" {
+  ami                         = data.aws_ami.amazon_linux.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.{{ rid|lower }}_{{ subnet.name|lower }}.id
+  vpc_security_group_ids      = [aws_security_group.{{ hp.host_id|lower }}.id]
+  key_name                    = aws_key_pair.{{ hp.host_id|lower }}.key_name
+  associate_public_ip_address = {{ "true" if hp.exposure == "public" else "false" }}
+  {% if hp.private_ip %}
+  private_ip                  = "{{ hp.private_ip }}"
+  {% endif %}
+
+  tags = {
+    Name = "{{ hp.host_id }}"
+  }
+}
+
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+
+# ============================================================
+# Real router EC2 appliances
+# - Created only for real routers from the input topology.
+# - Not created for inferred missing-router VPC-only domains.
+# - FRRouting is installed/enabled by default. OSPF networks/areas are still configured by Ansible when requested.
+# ============================================================
+
+{% if real_router_ids and not has_pc1 %}
+resource "tls_private_key" "router_mgmt" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "router_mgmt" {
+  key_name_prefix = "net2tf-pc1-router-mgmt-"
+  public_key      = tls_private_key.router_mgmt.public_key_openssh
+}
+
+resource "local_file" "router_mgmt" {
+  filename        = "PC1.pem"
+  content         = tls_private_key.router_mgmt.private_key_pem
+  file_permission = "0600"
+}
+{% endif %}
+
+{% for rid in real_router_ids %}
+{% if router_interface_subnets[rid]|length > 0 %}
+resource "aws_security_group" "{{ rid|lower }}_router_appliance" {
+  name        = "{{ rid|lower }}-router-appliance-sg"
+  description = "Security group for {{ rid }} router appliance"
+  vpc_id      = aws_vpc.{{ rid|lower }}.id
+
+  ingress {
+    description = "SSH from admin CIDR - lab only"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_cidr]
+  }
+
+  {% for rrid, rrouter in routers.items() %}
+  ingress {
+    description = "Internal traffic from {{ rrid }}"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["{{ rrouter.vpc_cidr }}"]
+  }
+  {% endfor %}
+
+  ingress {
+    description = "ICMP from RFC1918 internal networks"
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  }
+
+  egress {
+    description = "Allow all outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "{{ rid }}-router-appliance-sg"
+  }
+}
+
+resource "aws_instance" "{{ rid|lower }}_router_appliance" {
+  ami                         = data.aws_ami.amazon_linux.id
+  instance_type               = "{{ router_instance_types.get(rid, 't3.micro') }}"
+  subnet_id                   = aws_subnet.{{ rid|lower }}_{{ router_interface_subnets[rid][0]|lower }}.id
+  vpc_security_group_ids      = [aws_security_group.{{ rid|lower }}_router_appliance.id]
+{% if has_pc1 %}
+  key_name                    = aws_key_pair.pc1.key_name
+{% else %}
+  key_name                    = aws_key_pair.router_mgmt.key_name
+{% endif %}
+  associate_public_ip_address = {{ "true" if ns.has_public_by_router[rid] else "false" }}
+  source_dest_check           = false
+  user_data                   = <<-EOF
+#!/bin/bash
+set -eux
+sysctl -w net.ipv4.ip_forward=1 || true
+echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-net2tf-router.conf
+if command -v dnf >/dev/null 2>&1; then
+  dnf install -y frr || true
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y frr || true
+fi
+if [ -f /etc/frr/daemons ]; then
+  sed -i 's/^zebra=.*/zebra=yes/' /etc/frr/daemons || true
+  sed -i 's/^ospfd=.*/ospfd=yes/' /etc/frr/daemons || true
+  systemctl enable frr || true
+  systemctl restart frr || true
+fi
+EOF
+
+  tags = {
+    Name                = "{{ rid }}-router-appliance"
+    Role                = "real-router-appliance-frrouting"
+    EstimatedInterfaces = "{{ router_interface_counts.get(rid, router_interface_subnets[rid]|length) }}"
+    SelectedType        = "{{ router_instance_types.get(rid, 't3.micro') }}"
+    FRRouting           = "default"
+  }
+}
+
+{% for subnet_name in router_interface_subnets[rid][1:] %}
+resource "aws_network_interface" "{{ rid|lower }}_{{ subnet_name|lower }}_eni" {
+  subnet_id         = aws_subnet.{{ rid|lower }}_{{ subnet_name|lower }}.id
+  security_groups   = [aws_security_group.{{ rid|lower }}_router_appliance.id]
+  source_dest_check = false
+
+  tags = {
+    Name = "{{ rid }}-{{ subnet_name }}-router-eni"
+  }
+}
+
+resource "aws_network_interface_attachment" "{{ rid|lower }}_{{ subnet_name|lower }}_eni_attach" {
+  instance_id          = aws_instance.{{ rid|lower }}_router_appliance.id
+  network_interface_id = aws_network_interface.{{ rid|lower }}_{{ subnet_name|lower }}_eni.id
+  device_index         = {{ loop.index }}
+}
+{% endfor %}
+{% endif %}
+{% endfor %}
+

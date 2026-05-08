@@ -1,0 +1,48 @@
+# Generated Terraform Project
+
+Version 3 mapping model with RAG planning:
+
+- No-router topology -> inferred VPC only, no router EC2
+- Real router -> VPC + EC2 router appliance with FRRouting installed by default
+- Switch/LAN -> Subnet
+- PC/Server -> EC2
+- Firewall -> Security Group
+- Router-to-router -> VPC Peering or Transit Gateway
+
+## Current behavior
+- Private by default
+- Public access can be enabled per host
+- Each PC/server gets its own key pair and PEM file by default
+- Mixed public/private hosts on one LAN are split into public/private subnets
+- Internet Gateway is created only when a router domain contains public hosts
+- NAT Gateway is created when a private subnet explicitly needs outbound internet
+- Bastion host can be designated explicitly
+- Private hosts can be restricted to SSH only from bastion
+- Peering for small router topologies
+- TGW for larger router topologies
+- OSPF/FRR/VyOS config is Ansible-only on router appliances
+- Transit subnets are auto-created for router-only middle domains when needed
+- RAG planner output is checked against compiled output
+- Terraform fmt/init/validate quality checks are executed
+
+## Usage
+
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan
+
+## Notes
+- Override admin_cidr in terraform.tfvars for your real SSH source range
+- Public SSH should normally be restricted to a trusted CIDR
+
+## Final lab translation behavior
+
+- PCs are public by default for temporary lab SSH access.
+- Each PC gets its own PEM file.
+- Router appliances are created for later OSPF/FRRouting configuration.
+- Routers use PC1.pem by default.
+- admin_cidr defaults to 0.0.0.0/0 for lab use only.
+- ICMP is allowed internally for ping tests.
+- OSPF is not configured by Terraform. If requested, Ansible installs/configures FRRouting.
+
